@@ -7,6 +7,8 @@ from pyspark.sql import SparkSession
 # Función para referenciar columnas de un DataFrame de forma programática.
 from pyspark.sql.functions import col
 
+import argparse
+
 # Tipos de datos nativos del motor Catalyst de Spark para definir esquemas estáticos.
 from pyspark.sql.types import (
     StructType,   # Representa la estructura de una fila completa (el esquema).
@@ -24,6 +26,26 @@ SCHEMA = StructType([
     StructField('valor', LongType(), True),
 ])
 
+COLUMNAS_REQUERIDAS = {'id', 'cliente_id', 'valor'}
+
+def validar_columnas(df, requeridas=COLUMNAS_REQUERIDAS):
+    """
+    Valida que el DataFrame contenga todas las columnas requeridas.
+
+    Args:
+        df: DataFrame de Spark.
+        requeridas: Set de nombres de columnas obligatorias.
+
+    Raises:
+        ValueError: Si faltan columnas requeridas.
+    """
+    faltantes = requeridas - set(df.columns)
+    if faltantes:
+        raise ValueError(
+            f"Faltan columnas requeridas: {faltantes}. "
+            f"Columnas recibidas: {df.columns}"
+        )
+    return True
 
 def crear_spark():
     """
@@ -51,24 +73,43 @@ def obtener_errores(df):
     """
     return df.filter(col('valor').isNull() | (col('valor') <= 0))
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Validador y Analítica de Transacciones con Spark"
+    )
+    # Construcción de la ruta relativa hacia el archivo CSV
+    # Subir dos niveles desde este archivo e ingresar a /datos/transacciones.csv
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=Path(__file__).resolve().parents[1] / "datos" / "transacciones.csv",
+        help="Ruta del CSV de entrada"
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path(__file__).resolve().parents[1] / "datos" / "salida",
+        help="Directorio de salida"
+    )
+    return parser.parse_args()   
 
 # PIPELINE
 def main():
+    args = parse_args()
     spark = crear_spark()
     
-    try:
-        # Construcción de la ruta relativa hacia el archivo CSV
-        # Subir dos niveles desde este archivo e ingresar a /datos/transacciones.csv
-        ruta = Path(__file__).resolve().parents[1] / 'datos' / 'transacciones.csv'
-        
+    try:    
         # TIPO DE OPERACIÓN: TRANSFORMACIÓN
         # spark.read crea un DataFrameReader y valida metadatos; no carga el archivo completo en RAM.
         df = (
             spark.read
             .option('header', True)  # La primera fila contiene los encabezados.
             .schema(SCHEMA)          # Aplica el esquema predefinido.
-            .csv(str(ruta))          # Formato de entrada (requiere string).
+            .csv(str(args.input))          # Formato de entrada (requiere string).
         )
+
+        # Patrón Fail-Fast: validar estructura antes de consumir cómputo
+        validar_columnas(df)
 
         print('\n=== DATOS ORIGINALES ===')
         # TIPO DE OPERACIÓN: ACCIÓN
@@ -94,6 +135,9 @@ def main():
             print('PASS: No hay transacciones invalidas')
         else:
             print(f'FAIL: Se encontraron {total} transacciones invalidas')
+
+        args.output.mkdir(parents=True, exist_ok=True)
+        df.write.csv(str(args.output), header=True, mode="overwrite")
             
     finally:
         # Detiene la sesión y libera los recursos de la JVM, RAM y puertos asociados.
