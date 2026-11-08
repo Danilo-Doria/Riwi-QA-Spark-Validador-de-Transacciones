@@ -1,43 +1,30 @@
-# Manejo de rutas agnóstico al sistema operativo (Windows, Linux, macOS).
-from pathlib import Path
+"""
+Pipeline de calidad y análisis de transacciones con PySpark.
 
-# Punto de entrada principal a la funcionalidad de Spark SQL y DataFrames.
-from pyspark.sql import SparkSession
-
-# Función para referenciar columnas de un DataFrame de forma programática.
-from pyspark.sql.functions import col
-
+Flujo: leer CSV -> validar columnas -> etiquetar cada fila con un motivo de
+rechazo (o null si es válida) -> separar válidos/rechazados -> resumen por
+cliente -> guardar resultados.
+"""
 import argparse
+import sys
+from pathlib import Path   # Rutas independientes del sistema operativo
 
-# Tipos de datos nativos del motor Catalyst de Spark para definir esquemas estáticos.
-from pyspark.sql.types import (
-    StructType,   # Representa la estructura de una fila completa (el esquema).
-    StructField,  # Define los metadatos de una columna individual.
-    IntegerType,  # Entero con signo de 32 bits (-2^31 a 2^31 - 1).
-    LongType,     # Entero con signo de 64 bits (-2^63 a 2^63 - 1).
-)
+from pyspark.sql import SparkSession, Window
+from pyspark.sql import functions as F
+from pyspark.sql.functions import col, count, expr, lit, when
 
-# Evita la inferencia automática (inferSchema=True), lo cual ahorra lecturas
-# adicionales del archivo y previene errores de tipos en datos heterogéneos.
-SCHEMA = StructType([
-    # Formato: StructField(nombre_columna, tipo_dato, permite_nulos)
-    StructField('id', IntegerType(), True),
-    StructField('cliente_id', IntegerType(), True),
-    StructField('valor', LongType(), True),
-])
-
+# Columnas que el CSV debe traer sí o sí (el orden no importa).
 COLUMNAS_REQUERIDAS = {'id', 'cliente_id', 'valor'}
+
+# Umbral por defecto; se puede cambiar con --max-valor.
+MAX_VALOR = 10_000_000
+
 
 def validar_columnas(df, requeridas=COLUMNAS_REQUERIDAS):
     """
-    Valida que el DataFrame contenga todas las columnas requeridas.
-
-    Args:
-        df: DataFrame de Spark.
-        requeridas: Set de nombres de columnas obligatorias.
-
-    Raises:
-        ValueError: Si faltan columnas requeridas.
+    Comprueba que el DataFrame tenga todas las columnas requeridas.
+    Lanza ValueError con las que faltan y las que llegaron.
+    Solo mira los metadatos del DataFrame: no lee datos ni dispara cómputo.
     """
     faltantes = requeridas - set(df.columns)
     if faltantes:
@@ -47,101 +34,208 @@ def validar_columnas(df, requeridas=COLUMNAS_REQUERIDAS):
         )
     return True
 
+
+def leer_csv(spark, ruta):
+    """
+    Lee el CSV como texto, valida el encabezado real y castea por nombre.
+
+    Por qué no se usa .schema(...): Spark asignaría los tipos por posición e
+    ignoraría los nombres del encabezado, así que un CSV con columnas mal
+    nombradas o en otro orden pasaría sin error.
+
+    Devuelve: id, cliente_id, valor (tipados) y valor_original (texto crudo,
+    para distinguir "vacío" de "no numérico" más adelante).
+    """
+    if not Path(ruta).exists():
+        raise FileNotFoundError(f"No existe el archivo de entrada: {ruta}")
+
+    # TRANSFORMACIÓN (lazy): sin schema ni inferSchema, todo llega como string.
+    crudo = spark.read.option('header', True).csv(str(ruta))
+
+    # Fail-fast: se valida la estructura antes de gastar cómputo.
+    validar_columnas(crudo)
+
+    # try_cast devuelve null si el texto no se puede convertir, sin lanzar error
+    # (igual en Spark 3.x y en 4.x, donde ANSI está activo por defecto).
+    return crudo.select(
+        expr('try_cast(id as int)').alias('id'),
+        expr('try_cast(cliente_id as int)').alias('cliente_id'),
+        expr('try_cast(valor as bigint)').alias('valor'),
+        col('valor').alias('valor_original'),
+    )
+
+
 def crear_spark():
     """
-    Inicializa o recupera la SparkSession activa.
-    Configuración:
-      - master('local[2]'): Ejecución local empleando 2 núcleos/hilos de CPU.
-      - appName(...): Identificador de la aplicación en la Spark UI (puerto 4040).
+    Crea (o recupera) la SparkSession.
+      - local[2]: ejecución local con 2 hilos; no hace falta un clúster.
+      - shuffle.partitions=4: el valor por defecto (200) es excesivo para datos
+        pequeños; el shuffle de groupBy y ventanas crearía 200 tareas casi vacías.
     """
     return (
         SparkSession.builder
         .master('local[2]')
         .appName('Riwi-QA-Transacciones')
+        .config('spark.sql.shuffle.partitions', '4')
         .getOrCreate()
     )
 
 
-def obtener_errores(df):
+def agregar_motivo(df, valor_max=MAX_VALOR):
     """
-    Registros cuyo valor es nulo, cero o negativo.
-    
-    TIPO DE OPERACIÓN: TRANSFORMACIÓN (Narrow / Estrecha)
-    - No ejecuta cómputo de inmediato (Lazy Evaluation).
-    - Agrega un nodo de filtro al grafo acíclico dirigido (DAG).
-    - No genera 'shuffle' (no hay intercambio de datos entre nodos por red).
+    Agrega la columna 'motivo': el texto de la PRIMERA regla incumplida, o null
+    si la fila es válida. Así cada fila queda en un solo lado (válida o
+    rechazada) y válidos + rechazados = total.
+
+    El orden de los when() importa: gana el primero que se cumple. Las
+    comprobaciones de null van antes de las comparaciones numéricas, porque
+    comparar con null no da verdadero ni falso.
+
+    TRANSFORMACIÓN wide: la ventana por 'id' obliga a un shuffle para juntar
+    las filas con el mismo id.
     """
-    return df.filter(col('valor').isNull() | (col('valor') <= 0))
+    # Cuántas filas comparten el mismo id (para detectar duplicados).
+    veces_id = count(lit(1)).over(Window.partitionBy('id'))
+
+    motivo = (
+        when(col('id').isNull(), 'id ausente o no numérico')
+        .when(col('cliente_id').isNull(), 'cliente_id ausente o no numérico')
+        # 0 o negativo es un valor centinela de "sin cliente".
+        .when(col('cliente_id') <= 0, 'cliente_id inválido (menor o igual a cero)')
+        # valor null Y texto original null -> la celda venía vacía.
+        .when(col('valor').isNull() & col('valor_original').isNull(), 'valor ausente')
+        # Texto que empieza con símbolo de moneda, ej. "$569,856".
+        .when(col('valor').isNull() & col('valor_original').rlike(r'^\s*[$€£]'),
+              'valor con formato de moneda')
+        # Cualquier otro texto que no se pudo convertir, ej. "no_disponible".
+        .when(col('valor').isNull(), 'valor no numérico')
+        .when(col('valor') <= 0, 'valor menor o igual a cero')
+        .when(col('valor') > valor_max, 'valor excede el máximo permitido')
+        # Última regla: se rechazan todas las copias, porque no hay criterio
+        # para saber cuál es la correcta.
+        .when(veces_id > 1, 'id duplicado')
+        # Sin .otherwise(): las filas válidas quedan con motivo = null.
+    )
+    return df.withColumn('motivo', motivo)
+
+
+def separar(etiquetado):
+    """
+    Divide el DataFrame etiquetado en válidos (motivo null) y rechazados.
+    Los rechazados conservan valor_original (el texto crudo) como evidencia,
+    porque 'valor' sería null en casos como "$569,856".
+    TRANSFORMACIÓN narrow (filter y select): sin shuffle.
+    """
+    validos = (etiquetado.filter(col('motivo').isNull())
+               .select('id', 'cliente_id', 'valor'))
+    rechazados = (etiquetado.filter(col('motivo').isNotNull())
+                  .select('id', 'cliente_id', 'valor_original', 'motivo'))
+    return validos, rechazados
+
+
+def resumen_por_cliente(validos):
+    """
+    Resumen de las transacciones válidas por cliente: cantidad, total,
+    promedio, mínimo y máximo, ordenado por total descendente.
+    TRANSFORMACIÓN wide: groupBy mueve todas las filas de un cliente a la misma
+    partición (shuffle), que es la operación costosa de este pipeline.
+    """
+    return (validos.groupBy('cliente_id')
+            .agg(F.count('*').alias('num_transacciones'),
+                 F.sum('valor').alias('total'),
+                 F.round(F.avg('valor'), 2).alias('promedio'),
+                 F.min('valor').alias('minimo'),
+                 F.max('valor').alias('maximo'))
+            .orderBy(F.col('total').desc()))
+
+
+def ejecutar(spark, entrada, salida, valor_max=MAX_VALOR):
+    """
+    Pipeline completo. Devuelve los conteos (dict) para poder probarlo.
+    Lanza FileNotFoundError / ValueError si la entrada es inválida.
+    """
+    salida = Path(salida)
+    df = leer_csv(spark, entrada)
+
+    # cache(): 'etiquetado' alimenta varias acciones (3 count y 3 escrituras).
+    # Sin caché, cada una repetiría lectura, casteo y la ventana con shuffle.
+    # Costo: memoria, por eso se libera con unpersist() en el finally.
+    etiquetado = agregar_motivo(df, valor_max).cache()
+    try:
+        n_total = etiquetado.count()   # ACCIÓN: ejecuta el plan y llena el caché
+        if n_total == 0:
+            raise ValueError("El archivo no contiene filas de datos")
+
+        validos, rechazados = separar(etiquetado)
+        resumen = resumen_por_cliente(validos)
+
+        n_validos = validos.count()          # ACCIÓN
+        n_rechazados = rechazados.count()    # ACCIÓN
+
+        # Validación de negocio (no es un assert, que se puede desactivar con -O).
+        if n_validos + n_rechazados != n_total:
+            raise RuntimeError("Inconsistencia: se perdieron filas al separar")
+
+        # Rutas propias dentro de --output: overwrite solo toca estas tres.
+        salida.mkdir(parents=True, exist_ok=True)
+
+        # ACCIONES (write): materializan y guardan.
+        # Parquet para válidos: columnar, tipado, ideal para análisis posteriores.
+        validos.write.mode('overwrite').parquet(str(salida / 'validos'))
+        # CSV para rechazados y resumen: los revisa una persona.
+        rechazados.write.mode('overwrite').option('header', True).csv(str(salida / 'rechazados'))
+        resumen.write.mode('overwrite').option('header', True).csv(str(salida / 'resumen_cliente'))
+
+        print(f'Leídos: {n_total} | Válidos: {n_validos} | Rechazados: {n_rechazados}')
+        # ACCIONES (show): muestran el detalle en consola.
+        rechazados.groupBy('motivo').count().orderBy(F.col('count').desc()).show(truncate=False)
+        resumen.show(10)
+
+        return {'leidos': n_total, 'validos': n_validos, 'rechazados': n_rechazados}
+    finally:
+        etiquetado.unpersist()   # libera la memoria del caché aunque haya error
+
 
 def parse_args():
+    """Define los argumentos de línea de comandos. No hay rutas fijas."""
     parser = argparse.ArgumentParser(
-        description="Validador y Analítica de Transacciones con Spark"
+        description="Validador y analítica de transacciones con Spark"
     )
-    # Construcción de la ruta relativa hacia el archivo CSV
-    # Subir dos niveles desde este archivo e ingresar a /datos/transacciones.csv
-    parser.add_argument(
-        "--input",
-        type=Path,
-        default=Path(__file__).resolve().parents[1] / "datos" / "transacciones.csv",
-        help="Ruta del CSV de entrada"
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=Path(__file__).resolve().parents[1] / "datos" / "salida",
-        help="Directorio de salida"
-    )
-    return parser.parse_args()   
+    parser.add_argument("--input", type=Path, required=True,
+                        help="Ruta del CSV de entrada")
+    parser.add_argument("--output", type=Path, required=True,
+                        help="Directorio donde se guardan los resultados")
+    parser.add_argument("--max-valor", type=int, default=MAX_VALOR,
+                        help="Valor máximo permitido por transacción")
+    return parser.parse_args()
 
-# PIPELINE
+
 def main():
+    """
+    Punto de entrada. Códigos de salida:
+      0 = éxito (haya o no filas rechazadas: separarlas es el trabajo del programa)
+      1 = problema con la entrada (archivo inexistente, vacío o columnas faltantes)
+      2 = error inesperado
+    """
     args = parse_args()
+    if args.max_valor <= 0:
+        print("ERROR: --max-valor debe ser mayor que cero", file=sys.stderr)
+        sys.exit(1)
+
     spark = crear_spark()
-    
-    try:    
-        # TIPO DE OPERACIÓN: TRANSFORMACIÓN
-        # spark.read crea un DataFrameReader y valida metadatos; no carga el archivo completo en RAM.
-        df = (
-            spark.read
-            .option('header', True)  # La primera fila contiene los encabezados.
-            .schema(SCHEMA)          # Aplica el esquema predefinido.
-            .csv(str(args.input))          # Formato de entrada (requiere string).
-        )
-
-        # Patrón Fail-Fast: validar estructura antes de consumir cómputo
-        validar_columnas(df)
-
-        print('\n=== DATOS ORIGINALES ===')
-        # TIPO DE OPERACIÓN: ACCIÓN
-        # Dispara la ejecución del plan. Lee los datos, toma las primeras 20 filas 
-        # y las envía al Driver para imprimirlas en consola.
-        df.show()
-
-        # TIPO DE OPERACIÓN: TRANSFORMACIÓN
-        # Construye la expresión lógica de filtrado sobre 'df'.
-        errores = obtener_errores(df)
-        
-        print('\n=== REGISTROS INVALIDOS ===')
-        # TIPO DE OPERACIÓN: ACCIÓN
-        # Dispara el filtrado y muestra los primeros 20 registros que fallaron la regla.
-        errores.show()
-
-        # TIPO DE OPERACIÓN: ACCIÓN
-        # Computa la cantidad total de registros que coinciden con la condición.
-        # Cada partición cuenta localmente y consolida la suma total en el Driver.
-        total = errores.count()
-        
-        if total == 0:
-            print('PASS: No hay transacciones invalidas')
-        else:
-            print(f'FAIL: Se encontraron {total} transacciones invalidas')
-
-        args.output.mkdir(parents=True, exist_ok=True)
-        df.write.csv(str(args.output), header=True, mode="overwrite")
-            
+    codigo = 0
+    try:
+        ejecutar(spark, args.input, args.output, args.max_valor)
+        print('Proceso finalizado correctamente')
+    except (FileNotFoundError, ValueError) as e:
+        print(f'ERROR de entrada: {e}', file=sys.stderr)
+        codigo = 1
+    except Exception as e:
+        print(f'ERROR inesperado: {type(e).__name__}: {e}', file=sys.stderr)
+        codigo = 2
     finally:
-        # Detiene la sesión y libera los recursos de la JVM, RAM y puertos asociados.
-        spark.stop()
+        spark.stop()   # siempre libera JVM, memoria y puertos
+    sys.exit(codigo)   # va después del finally para que stop() siempre corra
 
 
 if __name__ == '__main__':

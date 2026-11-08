@@ -1,6 +1,6 @@
-# Riwi QA Spark — Validador de Transacciones
+# Riwi QA Spark — Pipeline de calidad y análisis de transacciones
 
-Pipeline de control de calidad de datos (*Data Quality Assurance*) implementado con **Apache Spark (PySpark)** y **Python 3.11**. El sistema valida registros financieros transaccionales aplicando reglas de negocio estrictas, esquemas predefinidos (*schema enforcement*) y una suite de pruebas unitarias automatizadas con **Pytest**.
+Pipeline por lotes con **Apache Spark (PySpark)** y **Python 3.11** que valida archivos de transacciones, separa los registros válidos de los rechazados (con el **motivo** de cada rechazo) y genera un resumen analítico por cliente. Incluye una suite de pruebas automatizadas con **Pytest**.
 
 ---
 
@@ -10,22 +10,20 @@ Pipeline de control de calidad de datos (*Data Quality Assurance*) implementado 
 2. [Estructura del Proyecto](#-estructura-del-proyecto)
 3. [Instalación y Configuración](#-instalación-y-configuración)
 4. [Ejecución del Pipeline](#-ejecución-del-pipeline)
-5. [Ejecución de Pruebas Unitarias](#-ejecución-de-pruebas-unitarias)
-6. [Arquitectura y Decisiones Técnicas](#-arquitectura-y-decisiones-técnicas)
+5. [Ejemplo de Entrada y Salida](#-ejemplo-de-entrada-y-salida)
+6. [Ejecución de Pruebas](#-ejecución-de-pruebas)
 7. [Reglas de Validación](#-reglas-de-validación)
-8. [Licencia](#-licencia)
+8. [Decisiones Técnicas](#-decisiones-técnicas)
+9. [Informe Técnico](#-informe-técnico)
+10. [Licencia](#-licencia)
 
 ---
 
 ## 🛠 Requisitos Previos
 
-Antes de configurar el entorno virtual, asegúrate de contar con las siguientes dependencias en tu sistema operativo:
-
-* **Python:** `3.11.18` (compatible con `3.11.x`)
-* **Java (JDK):** `OpenJDK 17` (obligatorio para el runtime de Apache Spark / JVM)
-* **Gestor de paquetes:** `pip` y soporte para entornos virtuales (`venv`)
-
-Verifica tus versiones instaladas ejecutando en la terminal:
+* **Python:** `3.11.x`
+* **Java (JDK):** 8, 11 o 17 (obligatorio para la JVM de Spark 3.5). Con versiones más nuevas pueden aparecer errores al iniciar Spark.
+* **pip** y soporte para entornos virtuales (`venv`)
 
 ```bash
 python3 --version
@@ -39,124 +37,159 @@ java -version
 ```text
 riwi-qa-spark/
 ├── datos/
-│   └── transacciones.csv       # Dataset fuente de transacciones a validar
+│   └── transacciones.csv       # Dataset de ejemplo (1200 filas)
+├── ejemplos/                   # CSV pequeño de entrada y su salida generada
 ├── src/
 │   ├── __init__.py
-│   └── validador.py            # Pipeline principal, esquema estático y lógica de filtrado
+│   └── validador.py            # Lectura, reglas, separación, resumen y CLI
 ├── tests/
-│   └── test_validador.py       # Pruebas unitarias y fixture de SparkSession con pytest
-├── LICENSE                     # Licencia del proyecto
-├── README.md                   # Documentación técnica del repositorio
-└── requirements.txt            # Dependencias fijadas del entorno
+│   ├── conftest.py             # Fixture de SparkSession compartida (scope=session)
+│   └── test_pipeline.py        # Reglas, entradas inválidas y consistencia de extremo a extremo
+├── INFORME.md                  # Investigación, fuentes y justificación de decisiones
+├── LICENSE
+├── pytest.ini
+├── README.md
+└── requirements.txt
 ```
 
 ---
 
 ## ⚙️ Instalación y Configuración
 
-1. **Ubicarse en la raíz del proyecto:**
+```bash
+cd riwi-qa-spark
+python3.11 -m venv .venv
+source .venv/bin/activate        # En Windows: .venv\Scripts\activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
 
-   ```bash
-   cd "/home/danilo/Documents/Riwi 2026/complements/Spark/riwi-qa-spark"
-   ```
+`requirements.txt`:
 
-2. **Crear y activar el entorno virtual (`.venv`):**
+```text
+pyspark==3.5.6
+pytest>=8,<9
+```
 
-   ```bash
-   python3.11 -m venv .venv
-   source .venv/bin/activate
-   ```
+Si Spark no encuentra Java, define `JAVA_HOME`:
 
-3. **Verificar el archivo `requirements.txt`:**
-
-   ```text
-   pyspark==3.5.6
-   pytest>=8,<9
-   ```
-
-4. **Instalar las dependencias:**
-
-   ```bash
-   pip install --upgrade pip
-   pip install -r requirements.txt
-   ```
-
-5. **Configurar `JAVA_HOME` (si no está definido en tu `.bashrc` o `.zshrc`):**
-
-   ```bash
-   export JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))
-   export PATH=$JAVA_HOME/bin:$PATH
-   ```
+```bash
+export JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))
+export PATH=$JAVA_HOME/bin:$PATH
+```
 
 ---
 
 ## 🚀 Ejecución del Pipeline
 
-El script principal lee el archivo `datos/transacciones.csv`, aplica el esquema explícito `SCHEMA` y reporta en consola tanto las transacciones originales como aquellas que incumplen las reglas de negocio.
-
-Ejecuta el módulo desde la raíz del proyecto:
+Desde la raíz del proyecto:
 
 ```bash
-python -m src.validador
+python -m src.validador --input datos/transacciones.csv --output datos/resultados
 ```
 
-### Salida esperada en consola
+| Argumento | Obligatorio | Descripción |
+| :--- | :---: | :--- |
+| `--input` | Sí | Ruta del CSV de entrada |
+| `--output` | Sí | Directorio donde se guardan los resultados |
+| `--max-valor` | No | Valor máximo permitido por transacción (por defecto `10000000`) |
 
-```text
-=== DATOS ORIGINALES ===
-+---+----------+-----+
-| id|cliente_id|valor|
-+---+----------+-----+
-|  1|       101|50000|
-|  2|       102|-2000|
-|  3|       103| NULL|
-|  4|       104|    0|
-+---+----------+-----+
+El CSV debe tener las columnas `id`, `cliente_id` y `valor`. El orden no importa: se leen por nombre.
 
-=== REGISTROS INVALIDOS ===
-+---+----------+-----+
-| id|cliente_id|valor|
-+---+----------+-----+
-|  2|       102|-2000|
-|  3|       103| NULL|
-|  4|       104|    0|
-+---+----------+-----+
+### Resultados generados
 
-FAIL: Se encontraron 3 transacciones invalidas
-```
+Spark escribe **directorios** con archivos `part-*`, no un archivo único. Dentro de `--output`:
+
+| Carpeta | Formato | Contenido |
+| :--- | :--- | :--- |
+| `validos/` | Parquet | `id, cliente_id, valor` de las transacciones válidas |
+| `rechazados/` | CSV | `id, cliente_id, valor_original, motivo` |
+| `resumen_cliente/` | CSV | Por cliente: `num_transacciones, total, promedio, minimo, maximo` (solo válidas) |
+
+Cada ejecución **sobrescribe** esas tres subcarpetas, y no toca nada más del directorio indicado.
+
+### Códigos de salida
+
+| Código | Significado |
+| :---: | :--- |
+| `0` | Proceso completado (**haya o no filas rechazadas**: separarlas es el trabajo del programa) |
+| `1` | Problema con la entrada: archivo inexistente, vacío, sin filas o con columnas faltantes |
+| `2` | Error inesperado |
 
 ---
 
-## 🧪 Ejecución de Pruebas Unitarias
+## 🔎 Ejemplo de Entrada y Salida
 
-La suite de pruebas automatizadas en `tests/test_validador.py` utiliza **Pytest** (`8.4.2`) e instancia una única sesión de Spark compartida a nivel de módulo (`@pytest.fixture(scope='module')`) para reducir la sobrecarga de arranque de la JVM.
+Ejecución sobre `datos/transacciones.csv`:
 
-Para ejecutar todas las pruebas desde la raíz del proyecto:
+```text
+Leídos: 1200 | Válidos: 690 | Rechazados: 510
+```
+
+Rechazos por motivo:
+
+| Motivo | Filas |
+| :--- | ---: |
+| cliente_id inválido (menor o igual a cero) | 107 |
+| valor menor o igual a cero | 98 |
+| valor con formato de moneda | 66 |
+| id duplicado | 65 |
+| id ausente o no numérico | 55 |
+| cliente_id ausente o no numérico | 54 |
+| valor ausente | 38 |
+| valor no numérico | 27 |
+
+En `ejemplos/` hay un CSV pequeño de entrada con la salida que genera, para comprobar el resultado a mano.
+
+---
+
+## 🧪 Ejecución de Pruebas
 
 ```bash
 python -m pytest -v
 ```
 
----
+Las 18 pruebas comparten una sola `SparkSession` (`tests/conftest.py`), así que el arranque de la JVM se paga una vez (la suite tarda alrededor de 30 segundos). Cubren:
 
-## 🏗 Arquitectura y Decisiones Técnicas
-
-* **Schema Enforcement (`StructType`):** Se define el esquema de datos explícitamente en lugar de utilizar `inferSchema=True`. Esto evita que Spark realice una lectura adicional completa sobre el archivo CSV para adivinar los tipos de datos, mejorando el rendimiento y garantizando consistencia de tipos (`IntegerType` y `LongType`).
-* **Evaluación Perezosa (*Lazy Evaluation*):** La función `obtener_errores(df)` construye una transformación estrecha (*narrow transformation*) mediante `.filter()`, la cual se evalúa en memoria por partición sin generar intercambio de datos por red (*shuffle*).
-* **Rutas Agnósticas (`pathlib.Path`):** El acceso a `datos/transacciones.csv` se resuelve dinámicamente usando `Path(__file__).resolve().parents[1]`, asegurando que el script funcione sin importar el directorio de trabajo desde el que se invoque.
-* **Cierre Seguro (`try / finally`):** El bloque `finally: spark.stop()` garantiza la liberación inmediata de hilos, memoria RAM y puertos locales incluso ante fallos inesperados durante la ejecución.
+* Cada regla de rechazo (incluido el caso válido), con CSV temporales reales.
+* Columnas faltantes, columnas en otro orden, archivo inexistente, archivo vacío y archivo solo con encabezado.
+* Consistencia de extremo a extremo: válidos + rechazados = leídos, y el resumen por cliente coincide con los válidos guardados.
 
 ---
 
 ## 🔍 Reglas de Validación
 
-El validador inspecciona cada fila bajo la siguiente estructura y criterios de calidad:
+Cada fila recibe **un solo motivo**: el de la primera regla que incumple, en este orden. Sin motivo, la fila es válida.
 
-| Columna | Tipo de Dato (Spark) | Nullable | Regla de Rechazo | Descripción del Error |
-| :--- | :--- | :---: | :--- | :--- |
-| `id` | `IntegerType()` | `True` | — | Identificador único de la transacción |
-| `cliente_id` | `IntegerType()` | `True` | — | Identificador del cliente asociado |
-| `valor` | `LongType()` | `True` | `col('valor').isNull() \| (col('valor') <= 0)` | Monto nulo, igual a cero o negativo |
+| # | Motivo | Origen | Por qué importa |
+| :-: | :--- | :--- | :--- |
+| 1 | `id ausente o no numérico` | Nueva | Sin identificador no se puede auditar la transacción |
+| 2 | `cliente_id ausente o no numérico` | Nueva | No se puede atribuir al resumen por cliente |
+| 3 | `cliente_id inválido (menor o igual a cero)` | Nueva | El `0` es un valor centinela de "sin cliente" y crearía un grupo falso en el resumen |
+| 4 | `valor ausente` | Original | Un monto vacío distorsiona sumas y promedios |
+| 5 | `valor con formato de moneda` | Nueva | Ej. `$569,856`: dato recuperable, pero con problema de formato en el origen |
+| 6 | `valor no numérico` | Original | Texto como `no_disponible` |
+| 7 | `valor menor o igual a cero` | Original | Montos nulos o negativos no son ventas válidas |
+| 8 | `valor excede el máximo permitido` | Nueva | Posible error de captura (ceros de más); umbral configurable |
+| 9 | `id duplicado` | Nueva | Podría contar dos veces el mismo ingreso; se rechazan todas las copias |
+
+---
+
+## 🏗 Decisiones Técnicas
+
+* **Lectura como texto + `try_cast` por nombre:** con `.schema(...)` Spark asigna los tipos por posición y no detecta un encabezado incorrecto. Leer como texto permite validar las columnas reales y distinguir un valor vacío de uno no numérico (se conserva `valor_original`).
+* **Rechazar en vez de limpiar:** un valor como `$569,856` se rechaza y no se corrige, porque el validador no debe adivinar el formato (por ejemplo, el significado de la coma).
+* **Un motivo por fila:** garantiza que cada fila cae en exactamente un lado y que válidos + rechazados = total.
+* **`cache()` con `unpersist()`:** el DataFrame etiquetado alimenta varias acciones; el caché evita recalcular, y se libera en un `finally`.
+* **Formatos de salida:** Parquet para válidos (tipado y columnar, pensado para análisis posteriores); CSV para rechazados y resumen (los revisa una persona).
+* **Cierre seguro:** `spark.stop()` siempre se ejecuta en un `finally`, y el código de salida se devuelve después.
+* **Rutas sin valores fijos:** entrada y salida se reciben por argumentos.
+
+---
+
+## 📘 Informe Técnico
+
+La investigación (evaluación diferida, esquemas y nulos, costo de agrupar, uso de caché, formatos y cuándo Spark no es necesario), las fuentes y la justificación completa están en [INFORME.md](INFORME.md).
 
 ---
 
@@ -169,5 +202,5 @@ Este proyecto se distribuye bajo la licencia incluida en el archivo [LICENSE](LI
 ## 👨‍💻 Author
 
 - GitHub: **[Danilo-Doria](https://github.com/Danilo-Doria)**
-- LinkedIn: **[Danilo Doria Diaz](https://www.linkedin.com/in/danilodd)**
+- LinkedIn: **[Danilo Doria Diaz](https://www.linkedin.com/in/danilo-doria-diaz/)**
 - Mail: **danilodoria519@gmail.com**
